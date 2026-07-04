@@ -264,6 +264,7 @@ def build_trainer_config(
 
         mixed_precision=bool(train_cfg["mixed_precision"]),
         gradient_clip=float(train_cfg["gradient_clip"]),
+        ema_decay=float(train_cfg.get("ema_decay", 0.999)),
 
         device=str(train_cfg.get("device", "auto")),
         seed=int(config["project"]["seed"]),

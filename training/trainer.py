@@ -6,6 +6,7 @@ Responsibilities:
   - Phase 2 (remaining epochs): differential LR fine-tuning of full model
   - Mixed precision (torch.amp.autocast + GradScaler)
   - Gradient clipping (after unscale, before optimizer step)
+  - EMA (Exponential Moving Average) of model weights for better generalisation
   - Per-epoch train + val loops with full metric logging
   - CSV + TensorBoard logging
   - Checkpoint saving (last_checkpoint.pt every epoch, best_model.pt on improvement)
@@ -15,6 +16,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import logging
 import math
@@ -37,6 +39,115 @@ from utils.device import resolve_device, get_device_info, memory_summary
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# EMA tracker
+# ---------------------------------------------------------------------------
+
+class _EMATracker:
+    """
+    Exponential Moving Average of all trainable model parameters.
+
+    After every optimizer step, the shadow weights are updated:
+        shadow[k] = decay * shadow[k] + (1 - decay) * param[k]
+
+    Why EMA helps:
+      Training weights oscillate around a minimum as the optimizer takes
+      steps. EMA smooths these oscillations by averaging the trajectory,
+      landing closer to the true minimum. On small datasets (like ours)
+      this consistently gives 1-3% better generalisation.
+
+    decay=0.999 gives an effective window of ~1000 steps.
+    For a ~7650-step run (50 epochs x 153 batches) this covers roughly
+    the last 6-7 epochs — exactly where the model converges.
+
+    Design:
+      - Shadow weights live on CPU in float32 to save GPU VRAM.
+      - Validation and best_model.pt use EMA weights via the apply()
+        context manager. last_checkpoint.pt keeps training weights so
+        resume works correctly.
+      - Non-trainable params (BatchNorm running stats, etc.) are always
+        taken from the live model — only requires_grad params are tracked.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {
+            name: param.data.detach().float().cpu()
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        }
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        """Update shadow weights. Call once after every optimizer.step()."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data.detach().float().cpu(), alpha=1.0 - self.decay
+                )
+
+    @contextlib.contextmanager
+    def apply(self, model: nn.Module):
+        """
+        Context manager: temporarily swap EMA weights into the model.
+        Original training weights are restored on exit — training continues
+        unaffected after the validation loop.
+
+        Usage:
+            with self._ema.apply(self.model):
+                # validation runs here with EMA weights
+                ...
+            # training weights restored here automatically
+        """
+        # Stash current training weights
+        backup: dict[str, torch.Tensor] = {
+            name: param.data.clone()
+            for name, param in model.named_parameters()
+            if name in self.shadow
+        }
+        # Load EMA weights into model
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                param.data.copy_(
+                    self.shadow[name].to(device=param.device, dtype=param.dtype)
+                )
+        try:
+            yield
+        finally:
+            # Restore training weights exactly
+            for name, param in model.named_parameters():
+                if name in backup:
+                    param.data.copy_(backup[name])
+
+    def ema_state_dict(self, model: nn.Module) -> dict[str, torch.Tensor]:
+        """
+        Build a full state_dict with EMA weights substituted for trainable params.
+        Non-trainable params (e.g. BN running mean/var) come from the live model.
+        This is saved as model_state in best_model.pt so inference gets EMA weights.
+        """
+        sd = {k: v.clone() for k, v in model.state_dict().items()}
+        for name, ema_weight in self.shadow.items():
+            if name in sd:
+                sd[name] = ema_weight.to(dtype=sd[name].dtype)
+        return sd
+
+    def state_dict(self) -> dict:
+        """Serialise for inclusion in training checkpoint."""
+        return {
+            "shadow": {k: v.cpu() for k, v in self.shadow.items()},
+            "decay": self.decay,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore from a training checkpoint (used by resume)."""
+        self.decay = state.get("decay", self.decay)
+        self.shadow = {k: v.float() for k, v in state["shadow"].items()}
+
+
+# ---------------------------------------------------------------------------
+# TrainerConfig
+# ---------------------------------------------------------------------------
 
 @dataclass
 class TrainerConfig:
@@ -62,6 +173,9 @@ class TrainerConfig:
     mixed_precision: bool = True
     gradient_clip: float = 1.0
 
+    # EMA
+    ema_decay: float = 0.999   # set to 0.0 to disable EMA
+
     device: str = "auto"
     seed: int = 42
 
@@ -77,6 +191,10 @@ class TrainerConfig:
 
     class_weights: Optional[Tensor] = field(default=None, repr=False)
 
+
+# ---------------------------------------------------------------------------
+# Trainer
+# ---------------------------------------------------------------------------
 
 class Trainer:
     """
@@ -122,6 +240,10 @@ class Trainer:
         self._start_epoch: int = 0
         self._in_phase2: bool = False
 
+        # EMA — initialised in train() after checkpoint restore so the shadow
+        # weights start from the correct (possibly resumed) model state
+        self._ema: Optional[_EMATracker] = None
+
         self._early_stopping_cb: EarlyStopping
         self._checkpoint_cb: ModelCheckpoint
         self._lr_monitor: LRMonitor
@@ -131,13 +253,13 @@ class Trainer:
         self._tb_writer = None
         self._setup_loggers()
 
-        # Log device info
         info = get_device_info(self.device)
         logger.info(
-            "Trainer ready | device=%s (%s) | AMP=%s",
+            "Trainer ready | device=%s (%s) | AMP=%s | EMA decay=%.4f",
             info["device"],
             info.get("name", ""),
             self._amp_enabled,
+            cfg.ema_decay,
         )
 
     # ------------------------------------------------------------------
@@ -153,9 +275,12 @@ class Trainer:
           Phase 2: epochs (freeze_backbone_epochs+1)..epochs — full model with
                    warmup + cosine scheduler and differential LR.
 
+        EMA: shadow weights are updated after every optimizer step.
+        Validation always runs with EMA weights. best_model.pt saves EMA weights.
+        last_checkpoint.pt saves training weights (needed for correct resume).
+
         Args:
-            resume_from: Path to last_checkpoint.pt to resume from. The Trainer
-                         restores epoch, optimizer, scheduler, and callback states.
+            resume_from: Path to last_checkpoint.pt to resume from.
 
         Returns:
             {
@@ -166,17 +291,20 @@ class Trainer:
         """
         history: list[dict] = []
 
-        # Build loss (done here so class_weights can be moved to device)
         self._loss_fn = self._build_loss()
         self._loss_fn.to(self.device)
 
-        # Restore from checkpoint if requested
         if resume_from is not None:
+            # EMA is initialised inside _load_checkpoint so the shadow weights
+            # are restored from the checkpoint rather than reset
             self._start_epoch = self._load_checkpoint(resume_from)
             logger.info("Resuming from epoch %d", self._start_epoch + 1)
         else:
-            # Fresh run — start Phase 1
             self._setup_phase1()
+            # Fresh run — initialise EMA from the starting model weights
+            if self.cfg.ema_decay > 0:
+                self._ema = _EMATracker(self.model, decay=self.cfg.ema_decay)
+                logger.info("EMA initialised | decay=%.4f", self.cfg.ema_decay)
 
         best_checkpoint_path: Optional[str] = None
 
@@ -192,14 +320,14 @@ class Trainer:
 
             # ── Phase transition ──────────────────────────────────────
             if epoch == self.cfg.freeze_backbone_epochs + 1 and not self._in_phase2:
-                logger.info("━" * 60)
+                logger.info("=" * 60)
                 logger.info("Epoch %d: switching to Phase 2 (full fine-tuning)", epoch)
                 self._setup_phase2()
 
             # ── Train ─────────────────────────────────────────────────
             train_metrics = self._train_epoch(epoch)
 
-            # ── Validate ──────────────────────────────────────────────
+            # ── Validate (with EMA weights) ───────────────────────────
             val_metrics = self._val_epoch(epoch)
 
             # ── Merge + LR ────────────────────────────────────────────
@@ -281,9 +409,13 @@ class Trainer:
             self.scaler.step(self._optimizer)
             self.scaler.update()
 
+            # ── EMA update ────────────────────────────────────────────
+            # Must happen after optimizer.step() so we track the updated weights.
+            if self._ema is not None:
+                self._ema.update(self.model)
+
             total_loss += loss.item()
 
-            # Accuracy (at default 0.5 threshold — for training monitoring only)
             with torch.no_grad():
                 preds = outputs["probs"][:, 1] >= 0.5
                 n_correct += (preds == labels.bool()).sum().item()
@@ -296,13 +428,14 @@ class Trainer:
 
     def _val_epoch(self, epoch: int) -> dict[str, float]:
         """
-        One full pass over the validation DataLoader.
+        One full pass over the validation DataLoader, run with EMA weights.
+
+        Using EMA weights for validation gives a more accurate signal for
+        early stopping and model selection — the EMA model generalises
+        better than the instantaneous training weights.
 
         Returns dict with keys: val_loss, val_acc, val_precision, val_recall,
         val_f1, val_f2, val_roc_auc.
-
-        Metrics are computed using sklearn at threshold=0.5 for consistency.
-        Full threshold optimization happens in the Evaluator (Step 6).
         """
         from sklearn.metrics import (
             accuracy_score,
@@ -318,7 +451,15 @@ class Trainer:
         all_probs: list[float] = []
         all_labels: list[int] = []
 
-        with torch.no_grad():
+        # Apply EMA weights for the duration of the validation loop.
+        # contextlib.nullcontext() is a no-op when EMA is disabled.
+        ema_ctx = (
+            self._ema.apply(self.model)
+            if self._ema is not None
+            else contextlib.nullcontext()
+        )
+
+        with ema_ctx, torch.no_grad():
             for images, labels in self.val_loader:
                 images = images.to(self.device, non_blocking=True)
                 labels = labels.to(self.device, non_blocking=True)
@@ -340,13 +481,12 @@ class Trainer:
         labels_arr = np.array(all_labels)
         preds = (probs >= 0.5).astype(int)
 
-        # Graceful handling of degenerate batches (all one class)
         kw = {"zero_division": 0}
-        acc = float(accuracy_score(labels_arr, preds))
+        acc  = float(accuracy_score(labels_arr, preds))
         prec = float(precision_score(labels_arr, preds, **kw))
-        rec = float(recall_score(labels_arr, preds, **kw))
-        f1 = float(f1_score(labels_arr, preds, **kw))
-        f2 = float(fbeta_score(labels_arr, preds, beta=2, **kw))
+        rec  = float(recall_score(labels_arr, preds, **kw))
+        f1   = float(f1_score(labels_arr, preds, **kw))
+        f2   = float(fbeta_score(labels_arr, preds, beta=2, **kw))
 
         if len(np.unique(labels_arr)) > 1:
             roc_auc = float(roc_auc_score(labels_arr, probs))
@@ -369,13 +509,8 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _setup_phase1(self) -> None:
-        """
-        Phase 1: freeze backbone, train head only with constant LR.
-
-        No warmup is needed here — the head is randomly initialized
-        and benefits from training at full lr_head from the start.
-        """
-        logger.info("━" * 60)
+        """Phase 1: freeze backbone, train head only with constant LR."""
+        logger.info("=" * 60)
         logger.info("Phase 1: Linear Probing (backbone FROZEN)")
 
         self.model.backbone.freeze()
@@ -383,25 +518,16 @@ class Trainer:
 
         param_groups = self.model.get_optimizer_param_groups(
             lr_head=self.cfg.lr_head,
-            lr_backbone=0.0,       # ignored — backbone is frozen
+            lr_backbone=0.0,
             weight_decay=self.cfg.weight_decay,
         )
         self._optimizer = self._build_optimizer(param_groups)
-
-        # Constant LR for the linear probe phase
         self._scheduler = torch.optim.lr_scheduler.LambdaLR(
             self._optimizer, lr_lambda=lambda _epoch: 1.0
         )
 
     def _setup_phase2(self) -> None:
-        """
-        Phase 2: unfreeze backbone, rebuild optimizer with differential LR,
-        and attach warmup + cosine scheduler.
-
-        Head uses lr_head_phase2 (10x lower than phase 1) because the head
-        has already adapted in phase 1 and only needs fine adjustment.
-        Backbone uses lr_backbone (100x lower than phase 1 lr_head).
-        """
+        """Phase 2: unfreeze backbone, rebuild optimizer with differential LR."""
         logger.info("Phase 2: Full Fine-Tuning (differential LR)")
         logger.info(
             "  lr_head=%.1e  lr_backbone=%.1e  warmup=%d epochs",
@@ -433,7 +559,6 @@ class Trainer:
             param_groups,
             betas=self.cfg.betas,
             eps=self.cfg.eps,
-            # LR and weight_decay are set per group in param_groups
         )
 
     def _build_scheduler(
@@ -442,15 +567,7 @@ class Trainer:
         total_epochs: int,
         warmup_epochs: int,
     ) -> LRScheduler:
-        """
-        Construct Linear Warmup → CosineAnnealingLR scheduler.
-
-        LinearLR ramps from (1/warmup_epochs) × base_lr to base_lr over
-        warmup_epochs steps. CosineAnnealingLR then decays from base_lr
-        to eta_min=min_lr over the remaining epochs.
-
-        SequentialLR combines both with the milestone at warmup_epochs.
-        """
+        """Construct Linear Warmup -> CosineAnnealingLR scheduler."""
         if warmup_epochs > 0:
             warmup = torch.optim.lr_scheduler.LinearLR(
                 optimizer,
@@ -468,8 +585,6 @@ class Trainer:
                 schedulers=[warmup, cosine],
                 milestones=[warmup_epochs],
             )
-
-        # No warmup — pure cosine decay
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=total_epochs,
@@ -510,7 +625,7 @@ class Trainer:
             from torch.utils.tensorboard import SummaryWriter
             tb_dir = log_dir / "tensorboard"
             self._tb_writer = SummaryWriter(log_dir=str(tb_dir))
-            logger.info("TensorBoard → %s  (run: tensorboard --logdir %s)", tb_dir, tb_dir)
+            logger.info("TensorBoard -> %s", tb_dir)
         except ImportError:
             logger.info("tensorboard not installed — skipping TB logging")
             self._tb_writer = None
@@ -523,16 +638,20 @@ class Trainer:
         self, epoch: int, metrics: dict, is_best: bool
     ) -> None:
         """
-        Save last_checkpoint.pt every epoch.
-        Save best_model.pt when is_best=True.
+        Save last_checkpoint.pt every epoch (training weights, for resume).
+        Save best_model.pt when is_best=True (EMA weights, for inference).
 
-        The checkpoint includes full training state so that training can be
-        resumed exactly from any epoch.
+        Keeping the two separate means:
+          - Resume: loads last_checkpoint.pt → training weights → optimizer
+            momentum is correct, training continues cleanly.
+          - Inference/Evaluation: loads best_model.pt → EMA weights →
+            smoother, more robust predictions.
         """
         checkpoint_dir = Path(self.cfg.checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        state = {
+        # last_checkpoint.pt: always uses live training weights
+        last_state = {
             "epoch": epoch,
             "model_state": self.model.state_dict(),
             "optimizer_state": self._optimizer.state_dict() if self._optimizer else None,
@@ -542,19 +661,23 @@ class Trainer:
             "phase": 2 if self._in_phase2 else 1,
             "early_stopping": self._early_stopping_cb.state_dict(),
             "model_checkpoint": self._checkpoint_cb.state_dict(),
+            "ema": self._ema.state_dict() if self._ema is not None else None,
         }
-
-        last_path = checkpoint_dir / "last_checkpoint.pt"
-        torch.save(state, last_path)
+        torch.save(last_state, checkpoint_dir / "last_checkpoint.pt")
 
         if is_best:
-            best_path = checkpoint_dir / "best_model.pt"
-            torch.save(state, best_path)
+            # best_model.pt: uses EMA weights when available
+            best_state = last_state.copy()
+            if self._ema is not None:
+                best_state["model_state"] = self._ema.ema_state_dict(self.model)
+                best_state["ema_weights_used"] = True
+            torch.save(best_state, checkpoint_dir / "best_model.pt")
             logger.info(
-                "Saved best_model.pt | epoch=%d | %s=%.4f",
+                "Saved best_model.pt | epoch=%d | %s=%.4f | EMA=%s",
                 epoch,
                 self.cfg.early_stopping_monitor,
                 metrics.get(self.cfg.early_stopping_monitor, float("nan")),
+                self._ema is not None,
             )
 
     def _load_checkpoint(self, path: str) -> int:
@@ -570,18 +693,15 @@ class Trainer:
 
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-        # Restore model
         self.model.load_state_dict(state["model_state"])
         self.model.to(self.device)
 
-        # Restore phase and rebuild optimizer/scheduler accordingly
         phase = state.get("phase", 1)
         if phase == 2:
             self._setup_phase2()
         else:
             self._setup_phase1()
 
-        # Restore optimizer + scheduler state
         if self._optimizer and state.get("optimizer_state"):
             self._optimizer.load_state_dict(state["optimizer_state"])
         if self._scheduler and state.get("scheduler_state"):
@@ -589,11 +709,19 @@ class Trainer:
         if state.get("scaler_state"):
             self.scaler.load_state_dict(state["scaler_state"])
 
-        # Restore callback states
         if "early_stopping" in state:
             self._early_stopping_cb.load_state_dict(state["early_stopping"])
         if "model_checkpoint" in state:
             self._checkpoint_cb.load_state_dict(state["model_checkpoint"])
+
+        # Restore EMA — initialise fresh then overwrite with saved shadow weights
+        if self.cfg.ema_decay > 0:
+            self._ema = _EMATracker(self.model, decay=self.cfg.ema_decay)
+            if state.get("ema") is not None:
+                self._ema.load_state_dict(state["ema"])
+                logger.info("EMA restored from checkpoint")
+            else:
+                logger.info("EMA initialised fresh (not in checkpoint)")
 
         epoch: int = state.get("epoch", 0)
         logger.info(
@@ -612,13 +740,8 @@ class Trainer:
 
     def _log_epoch(self, epoch: int, metrics: dict) -> None:
         """Write metrics to CSV and TensorBoard."""
-        # ── CSV ──────────────────────────────────────────────────────
         if self._csv_path is not None:
-            # Flatten to only serialisable scalar types
-            row = {
-                k: v for k, v in metrics.items()
-                if isinstance(v, (int, float))
-            }
+            row = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
             write_header = not self._csv_path.exists()
             with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=sorted(row.keys()))
@@ -626,7 +749,6 @@ class Trainer:
                     writer.writeheader()
                 writer.writerow(row)
 
-        # ── TensorBoard ───────────────────────────────────────────────
         if self._tb_writer is not None:
             for key, value in metrics.items():
                 if isinstance(value, (int, float)) and not math.isnan(value):
@@ -641,29 +763,20 @@ class Trainer:
     ) -> None:
         """Compact one-line epoch summary to console."""
         phase_tag = "P2" if self._in_phase2 else "P1"
-        best_tag = " ★" if ckpt_result.is_best else ""
-        stop_tag = " [STOP]" if es_result.stop_training else ""
-
-        mem = memory_summary(self.device)
-        mem_str = f" | {mem}" if mem else ""
+        best_tag  = " *" if ckpt_result.is_best else ""
+        stop_tag  = " [STOP]" if es_result.stop_training else ""
+        mem_str   = f" | {m}" if (m := memory_summary(self.device)) else ""
 
         logger.info(
             "Epoch %3d/%d [%s]%s  "
             "loss=%.4f/%.4f  acc=%.3f/%.3f  "
             "rec=%.3f  f2=%.3f  auc=%.3f%s%s",
-            epoch,
-            self.cfg.epochs,
-            phase_tag,
-            best_tag,
-            metrics.get("train_loss", 0),
-            metrics.get("val_loss", 0),
-            metrics.get("train_acc", 0),
-            metrics.get("val_acc", 0),
-            metrics.get("val_recall", 0),
-            metrics.get("val_f2", 0),
+            epoch, self.cfg.epochs, phase_tag, best_tag,
+            metrics.get("train_loss", 0), metrics.get("val_loss", 0),
+            metrics.get("train_acc", 0),  metrics.get("val_acc", 0),
+            metrics.get("val_recall", 0), metrics.get("val_f2", 0),
             metrics.get("val_roc_auc", 0),
-            mem_str,
-            stop_tag,
+            mem_str, stop_tag,
         )
 
     def _finalize_logging(self) -> None:
