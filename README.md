@@ -26,7 +26,7 @@ A production-grade binary image classifier that detects phishing websites from s
 
 The model learns to distinguish phishing pages from legitimate ones by visual appearance alone — page layout, typography, button placement, login forms, logo usage, and UI consistency. It deliberately does **not** see the URL, page source, or any text content. This forces it to generalise on visual patterns rather than memorise domains.
 
-**Model:** MobileCLIP-S2 (35.9M parameters, 256×256 input, 512-dim embeddings)  
+**Model:** MobileCLIP2-S2 (36M parameters, 256×256 input, 512-dim embeddings, pretrained on DFN-2B)  
 **Task:** Binary classification — `legitimate` (0) vs `phishing` (1)  
 **Security priority:** Minimise False Negatives (phishing missed) over False Positives (legit flagged)
 
@@ -498,9 +498,9 @@ training:
 
 ## Troubleshooting
 
-### `Pretrained value 'datacompdr' is not a known tag`
+### `Pretrained value 'dfndr2b' is not a known tag`
 
-Your `open_clip_torch` version is too old.
+Your `open_clip_torch` version is too old. MobileCLIP2 requires open_clip_torch >= 2.24.
 ```bash
 pip install --upgrade open_clip_torch
 ```
