@@ -49,9 +49,9 @@ class MobileCLIPBackbone(nn.Module):
     encoder) since this is a pure vision classification task.
 
     Args:
-        model_name:    OpenCLIP model identifier (e.g. "MobileCLIP2-S2").
-        pretrained:    OpenCLIP pretrained checkpoint tag (e.g. "dfndr2b").
-        embedding_dim: Expected output embedding dimension (512 for all MobileCLIP variants).
+        model_name:    OpenCLIP model identifier (e.g. "MobileCLIP-S2").
+        pretrained:    OpenCLIP pretrained checkpoint tag (e.g. "datacomp_s34b_b86k").
+        embedding_dim: Expected output embedding dimension (512 for MobileCLIP-S2).
         normalize:     If True, L2-normalize the output embeddings (recommended).
     """
 
@@ -68,8 +68,8 @@ class MobileCLIPBackbone(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "MobileCLIP2-S2",
-        pretrained: str = "dfndr2b",
+        model_name: str = "MobileCLIP-S2",
+        pretrained: str = "datacomp_s34b_b86k",
         embedding_dim: int = 512,
         normalize: bool = True,
     ) -> None:

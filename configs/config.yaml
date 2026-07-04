@@ -21,8 +21,8 @@ data:
   prefetch_factor: 2
 
 model:
-  backbone: "MobileCLIP2-S2"
-  pretrained: "dfndr2b"
+  backbone: "MobileCLIP-S2"
+  pretrained: "datacompdr"
   embedding_dim: 512
   freeze_backbone_epochs: 5
   dropout: 0.3
