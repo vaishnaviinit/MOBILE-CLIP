@@ -19,13 +19,15 @@ We are not reading the URL, the page source, or any text. We are looking at the 
 - But the visual design of a phishing page — the fake PayPal login, the urgency banner, the off-brand colours — stays consistent because they are copying templates
 - A model trained on visual patterns generalises better than one memorising URLs or HTML structure
 
-### What is MobileCLIP?
+### What is MobileCLIP2?
 
 CLIP stands for **Contrastive Language-Image Pretraining**. It is a model trained by OpenAI (and later improved by many labs) on hundreds of millions of image-text pairs from the internet. During training, CLIP learns to match images with their text descriptions. The side effect is that the image encoder learns extremely rich visual features — it understands objects, scenes, layouts, colours, and styles.
 
-MobileCLIP is Apple's efficient version of CLIP. Instead of a giant ViT-L/14 backbone, it uses a compact hybrid architecture (CNN + lightweight transformer) that runs fast on mobile devices. MobileCLIP-S2 has 35.9 million parameters — about 10× smaller than the original CLIP while retaining most of its representational quality.
+MobileCLIP is Apple's efficient version of CLIP. Instead of a giant ViT-L/14 backbone, it uses a compact hybrid architecture (CNN + lightweight transformer) that runs fast on mobile devices.
 
-We take MobileCLIP's image encoder (the "visual backbone") and add a small classification head on top. This is called **transfer learning** — we start with a model that already understands the visual world, and we fine-tune it to recognise the specific patterns of phishing pages.
+We use **MobileCLIP2-S2** — the second generation, pretrained on **DFN-2B** (a high-quality filtered dataset of 2 billion image-text pairs, vs the 1 billion used for v1). Same ~36M parameter count as v1 but meaningfully stronger visual features because of the better training data. The pretrained tag in OpenCLIP is `dfndr2b`.
+
+We take MobileCLIP2's image encoder (the "visual backbone") and add a small classification head on top. This is called **transfer learning** — we start with a model that already understands the visual world, and we fine-tune it to recognise the specific patterns of phishing pages.
 
 ### Why False Negatives are worse than False Positives
 
@@ -55,11 +57,11 @@ OpenCLIP (`open_clip_torch`) is an open-source implementation of CLIP models mai
 
 ```python
 import open_clip
-model, _, _ = open_clip.create_model_and_transforms('MobileCLIP-S2', pretrained='datacompdr')
+model, _, _ = open_clip.create_model_and_transforms('MobileCLIP2-S2', pretrained='dfndr2b')
 encoder = model.visual   # we only want the image encoder, not the text encoder
 ```
 
-The pretrained tag `datacompdr` means the model was trained on DataComp-1B, a curated dataset of 1 billion image-text pairs.
+The pretrained tag `dfndr2b` means the model was trained on DFN-2B, a dataset of 2 billion filtered image-text pairs (higher quality than the original DataComp-1B used for MobileCLIP v1).
 
 ### torchvision
 
@@ -89,8 +91,8 @@ Reads `configs/config.yaml` into a Python dictionary. Every hyperparameter is in
 
 ```yaml
 model:
-  backbone: "MobileCLIP-S2"   # which OpenCLIP model to use
-  pretrained: "datacompdr"    # which pretrained checkpoint
+  backbone: "MobileCLIP2-S2"  # which OpenCLIP model to use
+  pretrained: "dfndr2b"       # which pretrained checkpoint (DFN-2B dataset)
   freeze_backbone_epochs: 5   # how long to keep backbone frozen (Phase 1)
   embedding_dim: 512          # size of the feature vector output
 ```
@@ -461,6 +463,53 @@ Phase 2 schedule:
 
 Warmup prevents large updates immediately after the backbone unfreezes. Cosine decay provides a smooth, gradual reduction in LR — the model makes smaller and smaller adjustments as it converges.
 
+**EMA (Exponential Moving Average) — `_EMATracker`:**
+
+During training, model weights bounce around as the optimizer takes steps — each batch pushes the weights in a slightly different direction based on whatever samples happened to be in that batch. The final weights (at the last step of training) can be at a local "noisy" point rather than a smooth one.
+
+EMA keeps a running average of all weight values over the entire training history:
+
+```
+shadow_weight = decay × shadow_weight + (1 - decay) × current_weight
+```
+
+With `decay=0.999`, the shadow weight moves very slowly — it effectively represents the average of the last ~1000 optimizer steps (the last 6-7 epochs). This smooth average lands in a flatter, more stable region of the loss landscape and generalises better to unseen data.
+
+**How it is used in this codebase:**
+
+1. After every `optimizer.step()`, `self._ema.update(self.model)` updates all shadow weights.
+2. When validation runs, `with self._ema.apply(self.model):` temporarily swaps EMA weights into the model. The validation loop runs with EMA weights. At the end of the `with` block, the original training weights are automatically restored.
+3. When `best_model.pt` is saved, `self._ema.ema_state_dict(self.model)` builds a state dict with EMA weights substituted for all trainable parameters. This is what inference uses.
+4. `last_checkpoint.pt` always saves the live training weights plus the EMA shadow dict, so training can be resumed correctly.
+
+**Why validation uses EMA weights:**
+
+The val_f2 that early stopping watches should reflect the EMA model (the one that goes to production), not the instantaneous training model. Without EMA, early stopping might save a checkpoint that looks good in training but is actually at a local "noisy" peak. With EMA, what you see in val is what you get in production.
+
+**The `apply()` context manager:**
+
+```python
+@contextlib.contextmanager
+def apply(self, model):
+    # 1. Save current training weights
+    backup = {name: param.data.clone() for name, param in model.named_parameters()}
+    # 2. Load EMA weights
+    for name, param in model.named_parameters():
+        param.data.copy_(self.shadow[name])
+    try:
+        yield   # validation runs here
+    finally:
+        # 3. Always restore training weights, even if validation crashes
+        for name, param in model.named_parameters():
+            param.data.copy_(backup[name])
+```
+
+The `try/finally` ensures training weights are ALWAYS restored, even if an exception occurs inside the validation loop. This is important — if restoration failed, the optimizer would be updating EMA weights during the next training epoch, which would corrupt everything.
+
+**To disable EMA:**
+
+Set `training.ema_decay: 0` in `configs/config.yaml`. The Trainer checks `if self._ema is not None` at every point, so EMA cleanly drops out with no other changes.
+
 ---
 
 ### `evaluation/`
@@ -736,6 +785,45 @@ embedding = model.backbone.extract_features(tensor)  # [1, 512]
 
 This is the hook for the future ensemble. Instead of a binary prediction, it returns the raw 512-dimensional feature vector. The ensemble model will take this vector alongside URL features (domain age, SSL certificate, WHOIS data) and make the final decision.
 
+**`--tta` flag — Test-Time Augmentation:**
+
+Test-Time Augmentation (TTA) runs the model multiple times on slightly different versions of the same image and averages the predictions. No retraining needed — it is a pure inference-time trick.
+
+Why it works: a single center-crop might accidentally hide a suspicious element near the edge of the screenshot — for example, a fake bank logo that's slightly cut off, or a suspicious login form that's partially outside the center crop. Different random crops expose different regions. Averaging the phishing probability across all views reduces this "luck of the crop" variance.
+
+```
+Views used:
+  View 0: deterministic center crop (val transform)  ← the reliable anchor
+  Views 1-5: random crops via train transform (mild augmentation)
+  Total: 6 forward passes, probabilities averaged
+```
+
+The train transform used for TTA is the same mild augmentation applied during training — only slight zooms and colour shifts. No aggressive augmentation that would distort meaning.
+
+```python
+def run_inference_tta(model, image_path, threshold, device, n_augments=5):
+    all_probs = []
+
+    # View 0: deterministic center crop
+    tensor = val_transform(image).unsqueeze(0).to(device)
+    probs = model(tensor)["probs"][0, 1]
+    all_probs.append(probs)
+
+    # Views 1..N: random crops
+    for _ in range(n_augments):
+        tensor = train_transform(image).unsqueeze(0).to(device)
+        probs = model(tensor)["probs"][0, 1]
+        all_probs.append(probs)
+
+    # Average and threshold
+    avg_prob = sum(all_probs) / len(all_probs)
+    predicted_class = "phishing" if avg_prob >= threshold else "legitimate"
+```
+
+The output includes `tta_individual_probs` — the raw probability from each view. If all views agree (e.g. [0.91, 0.89, 0.93, 0.88, 0.92, 0.90]), the model is very confident. If they spread wide (e.g. [0.61, 0.32, 0.78, 0.41, 0.55, 0.69]), the image is genuinely ambiguous — the phishing content might only be visible from certain crops.
+
+TTA is recommended for production deployments where the cost of a False Negative (missed phishing) justifies the extra inference time (~6× slower but still milliseconds on GPU).
+
 ---
 
 ## Part 4 — How to Read the Training Output
@@ -749,12 +837,14 @@ Epoch   2/50 [P1]    loss=0.7234/0.7121  acc=0.671/0.681  rec=0.601  f2=0.631  a
 Breaking it down:
 - `Epoch 1/50` — current epoch out of total
 - `[P1]` — Phase 1 (backbone frozen). Changes to `[P2]` after `freeze_backbone_epochs`
-- `*` — star means this epoch's `val_f2` was the best seen so far (model saved to `best_model.pt`)
-- `loss=0.82/0.79` — train loss / val loss
-- `acc=0.61/0.64` — train accuracy / val accuracy
-- `rec=0.521` — validation recall (fraction of phishing pages caught)
-- `f2=0.572` — validation F2 score (the primary metric)
-- `auc=0.701` — validation ROC-AUC
+- `*` — star means this epoch's `val_f2` was the best seen so far (EMA weights saved to `best_model.pt`)
+- `loss=0.82/0.79` — train loss / val loss (val loss computed with EMA weights)
+- `acc=0.61/0.64` — train accuracy / val accuracy (val computed with EMA weights)
+- `rec=0.521` — validation recall with EMA weights (fraction of phishing pages caught)
+- `f2=0.572` — validation F2 score with EMA weights (the primary metric for early stopping)
+- `auc=0.701` — validation ROC-AUC with EMA weights
+
+All validation metrics use EMA weights. This means they represent what the production model will actually achieve, not a snapshot of the noisy training weights at that exact step.
 
 **What to look for:**
 
@@ -782,12 +872,14 @@ scripts/train.py
     |           -> phishing sampled 5.34x more often
     |
     ├── build_model()
-    |       MobileCLIPBackbone("MobileCLIP-S2", pretrained="datacompdr")
-    |           -> loads 35.9M pretrained weights from HuggingFace
+    |       MobileCLIPBackbone("MobileCLIP2-S2", pretrained="dfndr2b")
+    |           -> loads 36M pretrained weights from HuggingFace (DFN-2B dataset)
     |       ClassificationHead (LayerNorm -> Linear -> GELU -> Dropout -> Linear)
     |       PhishingClassifier(backbone, head)
     |
     ├── Trainer.train()
+    |       _EMATracker initialised (shadow weights = starting model weights)
+    |
     |       Phase 1 (epochs 1-5):
     |           backbone.freeze()
     |           optimizer = AdamW([head_params], lr=1e-3)
@@ -796,33 +888,38 @@ scripts/train.py
     |               loss = FocalLoss(logits, labels, alpha=[0.594, 3.168], gamma=2)
     |               loss.backward() -> gradients on head only
     |               optimizer.step()
-    |           val loop -> val_f2 computed
-    |           callbacks -> save best_model.pt if improved
+    |               ema.update(model)  <- shadow = 0.999*shadow + 0.001*weights
+    |           with ema.apply(model):
+    |               val loop -> val_f2 computed using EMA weights
+    |           callbacks -> if val_f2 improved: save best_model.pt (EMA weights)
+    |                        always:              save last_checkpoint.pt (training weights)
     |
     |       Phase 2 (epochs 6-50):
     |           backbone.unfreeze()
     |           optimizer = AdamW([backbone_params (lr=1e-5), head_params (lr=1e-4)])
     |           scheduler = warmup (2 epochs) -> cosine decay to 1e-7
-    |           same loop as Phase 1, now with gradient flowing through backbone
+    |           same loop as Phase 1, gradient now flows through backbone too
     |
-    └── outputs/checkpoints/best_model.pt  <- weights from best val_f2 epoch
+    └── outputs/checkpoints/best_model.pt  <- EMA weights from best val_f2 epoch
 
 scripts/evaluate.py
     |
-    ├── load best_model.pt
+    ├── load best_model.pt (contains EMA weights automatically)
     ├── run inference on 524 test images (never seen during training)
     ├── ThresholdOptimizer.optimize()
     |       sweeps 181 thresholds -> finds F2-optimal threshold (e.g. 0.35)
     ├── compute all metrics at recommended threshold
     └── save predictions.json, false_negatives.json, evaluation_report.json
+           evaluation_report.json stores recommended_threshold = 0.35
 
-scripts/infer.py --image screenshot.png
+scripts/infer.py --image screenshot.png --tta
     |
-    ├── load best_model.pt
-    ├── read threshold from evaluation_report.json (e.g. 0.35)
-    ├── preprocess image -> [1, 3, 256, 256] tensor
-    ├── forward pass -> {"logits", "probs", "embeddings"}
-    ├── phishing_prob = probs[0, 1]
-    ├── predicted_class = "phishing" if phishing_prob >= 0.35 else "legitimate"
-    └── print JSON result
+    ├── load best_model.pt (EMA weights, loaded transparently)
+    ├── read threshold 0.35 from evaluation_report.json
+    ├── load image, apply val_transform -> [1, 3, 256, 256] tensor (view 0)
+    ├── apply train_transform 5 more times -> views 1-5
+    ├── run model forward pass 6 times, collect phishing_prob each time
+    ├── avg_prob = mean([p0, p1, p2, p3, p4, p5])
+    ├── predicted_class = "phishing" if avg_prob >= 0.35 else "legitimate"
+    └── print JSON with avg_prob, individual probs, inference_time_ms
 ```
