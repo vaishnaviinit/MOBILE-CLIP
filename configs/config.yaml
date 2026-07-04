@@ -1,0 +1,96 @@
+project:
+  name: "phishing-clip-classifier"
+  version: "1.0.0"
+  seed: 42
+
+paths:
+  dataset_root: "dataset"
+  output_dir: "outputs"
+  checkpoint_dir: "outputs/checkpoints"
+  log_dir: "outputs/logs"
+  prediction_dir: "outputs/predictions"
+  visualization_dir: "outputs/visualizations"
+
+data:
+  image_size: 256
+  train_split: 0.70
+  val_split: 0.15
+  test_split: 0.15
+  num_workers: 0    # set to 4+ on Linux/Mac; keep 0 on Windows to avoid spawn issues
+  pin_memory: false # set to true when num_workers > 0 and using CUDA
+  prefetch_factor: 2
+
+model:
+  backbone: "MobileCLIP-S2"
+  pretrained: "datacompdr"
+  embedding_dim: 512
+  freeze_backbone_epochs: 5
+  dropout: 0.3
+  hidden_dim: 256
+
+training:
+  batch_size: 32
+  epochs: 50
+  device: "auto"
+
+  optimizer:
+    name: "adamw"
+    lr_head: 1.0e-3           # Phase 1 (linear probe): head-only LR
+    lr_head_phase2: 1.0e-4    # Phase 2 (fine-tune): reduced head LR
+    lr_backbone: 1.0e-5       # Phase 2 backbone LR (100x lower than phase 1 head)
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    name: "warmup_cosine"
+    warmup_epochs: 2
+    min_lr: 1.0e-7
+
+  loss:
+    name: "focal"
+    gamma: 2.0
+    label_smoothing: 0.0
+
+  mixed_precision: true
+  gradient_clip: 1.0
+
+  early_stopping:
+    patience: 10
+    monitor: "val_f2"
+    mode: "max"
+    min_delta: 1.0e-4
+
+evaluation:
+  threshold: 0.5
+  threshold_strategy: "f2"   # options: f1, f2, min_fnr
+  min_fnr_target: 0.05
+
+augmentation:
+  random_resized_crop:
+    scale: [0.85, 1.0]
+    ratio: [0.9, 1.1]
+  color_jitter:
+    brightness: 0.15
+    contrast: 0.15
+    saturation: 0.10
+    hue: 0.0
+  gaussian_blur:
+    p: 0.15
+    kernel_size: 3
+    sigma: [0.1, 0.5]
+  random_grayscale:
+    p: 0.03
+  random_erasing:
+    p: 0.10
+    scale: [0.01, 0.08]
+
+inference:
+  threshold: 0.5
+  device: "auto"
+
+logging:
+  level: "INFO"
+  tensorboard: true
+  csv: true
+  console: true
